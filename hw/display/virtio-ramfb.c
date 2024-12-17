@@ -3,9 +3,115 @@
 #include "hw/pci/pci.h"
 #include "ui/console.h"
 #include "hw/qdev-properties.h"
-#include "virtio-ramfb.h"
+#include "hw/display/bochs-vbe.h" /* for limits */
 #include "qapi/error.h"
 #include "qom/object.h"
+#include "hw/loader.h"
+#include "hw/display/virtio-ramfb.h"
+#include "qemu/units.h"
+
+static DisplaySurface *ramfb_create_display_surface(int width, int height,
+                                                    pixman_format_code_t format,
+                                                    hwaddr stride,
+                                                    void *data, hwaddr maxsize)
+{
+    DisplaySurface *surface;
+    hwaddr size, mapsize, linesize;
+
+    if (width < 16 || width > VBE_DISPI_MAX_XRES ||
+        height < 16 || height > VBE_DISPI_MAX_YRES ||
+        format == 0 /* unknown format */)
+        return NULL;
+
+    linesize = width * PIXMAN_FORMAT_BPP(format) / 8;
+    if (stride == 0) {
+        stride = linesize;
+    }
+
+    mapsize = size = stride * (height - 1) + linesize;
+    if (mapsize > maxsize) {
+        return NULL;
+    }
+
+    surface = qemu_create_displaysurface_from(width, height,
+                                              format, stride, data);
+
+    return surface;
+}
+
+static void ramfb_fw_cfg_write(void *dev, off_t offset, size_t len)
+{
+    VirtIORAMFBBase *s = dev;
+    DisplaySurface *surface;
+    uint32_t fourcc, format, width, height;
+    hwaddr stride;
+
+    width  = be32_to_cpu(s->cfg.width);
+    height = be32_to_cpu(s->cfg.height);
+    stride = be32_to_cpu(s->cfg.stride);
+    fourcc = be32_to_cpu(s->cfg.fourcc);
+    format = qemu_drm_format_to_pixman(fourcc);
+
+    surface = ramfb_create_display_surface(width, height,
+                                           format, stride,
+                                           s->vram_ptr, s->vram_size);
+    if (!surface) {
+        return;
+    }
+
+    s->width = width;
+    s->height = height;
+    qemu_free_displaysurface(s->ds);
+    s->ds = surface;
+}
+
+static void ramfb_display_update(QemuConsole *con, VirtIORAMFBBase *s)
+{
+    if (!s->width || !s->height) {
+        return;
+    }
+
+    if (s->ds) {
+        dpy_gfx_replace_surface(con, s->ds);
+        s->ds = NULL;
+    }
+
+    /* simple full screen update */
+    dpy_gfx_update_full(con);
+}
+
+static int ramfb_post_load(void *opaque, int version_id)
+{
+    ramfb_fw_cfg_write(opaque, 0, 0);
+    return 0;
+}
+
+const VMStateDescription virtio_ramfb_vmstate = {
+    .name = "virtio-ramfb",
+    .version_id = 1,
+    .minimum_version_id = 1,
+    .post_load = ramfb_post_load,
+    .fields = (const VMStateField[]) {
+        VMSTATE_BUFFER_UNSAFE(cfg, VirtIORAMFBBase, 0, sizeof(VirtIORAMFBCfg)),
+        VMSTATE_END_OF_LIST()
+    }
+};
+
+static bool ramfb_setup(VirtIORAMFBBase *s, Error **errp)
+{
+    FWCfgState *fw_cfg = fw_cfg_find();
+
+    if (!fw_cfg || !fw_cfg->dma_enabled) {
+        error_setg(errp, "ramfb device requires fw_cfg with DMA");
+        return false;
+    }
+
+    rom_add_vga("vgabios-ramfb.bin");
+    fw_cfg_add_file_callback(fw_cfg, "etc/virtio-ramfb",
+                             NULL, ramfb_fw_cfg_write, s,
+                             &s->cfg, sizeof(s->cfg), false);
+    return true;
+}
 
 static int virtio_ramfb_get_flags(void *opaque)
 {
@@ -47,7 +153,7 @@ static void virtio_ramfb_update_display(void *opaque)
     if (g->enable) {
         g->hw_ops->gfx_update(g);
     } else {
-        ramfb_display_update(g->scanout[0].con, vramfb->ramfb);
+        ramfb_display_update(g->scanout[0].con, vramfb);
     }
 }
 
@@ -80,33 +186,35 @@ static const GraphicHwOps virtio_ramfb_ops = {
     .gl_block = virtio_ramfb_gl_block,
 };
 
-static const VMStateDescription vmstate_virtio_ramfb = {
-    .name = "virtio-ramfb",
-    .version_id = 2,
-    .minimum_version_id = 2,
-    .fields = (VMStateField[]) {
-        /* no pci stuff here, saving the virtio device will handle that */
-        /* FIXME */
-        VMSTATE_END_OF_LIST()
-    }
-};
-
 /* RAMFB device wrapper around PCI device around virtio GPU */
 static void virtio_ramfb_realize(VirtIOPCIProxy *vpci_dev, Error **errp)
 {
-    VirtIORAMFBBase *vramfb = VIRTIO_RAMFB_BASE(vpci_dev);
-    VirtIOGPUBase *g = vramfb->vgpu;
+    VirtIORAMFBBase *s = VIRTIO_RAMFB_BASE(vpci_dev);
+    VirtIOGPUBase *g = s->vgpu;
     int i;
+
+    /* init ramfb */
+    if (!ramfb_setup(s, errp)) {
+        return;
+    }
+
+    /* init vram */
+    s->vram_size_mb = pow2ceil(s->vram_size_mb);
+    s->vram_size = s->vram_size_mb * MiB;
+    if (!memory_region_init_ram(&s->vram, OBJECT(vpci_dev), "ramfb.vram",
+                                s->vram_size, errp)) {
+        return;
+    }
+    s->vram_ptr = memory_region_get_ram_ptr(&s->vram);
+    pci_register_bar(&vpci_dev->pci_dev, 0,
+                     PCI_BASE_ADDRESS_MEM_PREFETCH, &s->vram);
 
     /* init virtio bits */
     virtio_pci_force_virtio_1(vpci_dev);
     if (!qdev_realize(DEVICE(g), BUS(&vpci_dev->bus), errp)) {
         return;
     }
-
-    /* init ramfb */
-    vramfb->ramfb = ramfb_setup(errp);
-    graphic_console_set_hwops(g->scanout[0].con, &virtio_ramfb_ops, vramfb);
+    graphic_console_set_hwops(g->scanout[0].con, &virtio_ramfb_ops, s);
 
     for (i = 0; i < g->conf.max_outputs; i++) {
         object_property_set_link(OBJECT(g->scanout[i].con), "device",
@@ -124,6 +232,7 @@ static void virtio_ramfb_reset(DeviceState *dev)
 
 static Property virtio_ramfb_base_properties[] = {
     DEFINE_VIRTIO_GPU_PCI_PROPERTIES(VirtIOPCIProxy),
+    DEFINE_PROP_UINT32("vgamem_mb", VirtIORAMFBBase, vram_size_mb, 8),
     DEFINE_PROP_END_OF_LIST(),
 };
 
@@ -136,7 +245,7 @@ static void virtio_ramfb_base_class_init(ObjectClass *klass, void *data)
 
     set_bit(DEVICE_CATEGORY_DISPLAY, dc->categories);
     device_class_set_props(dc, virtio_ramfb_base_properties);
-    dc->vmsd = &vmstate_virtio_ramfb;
+    dc->vmsd = &virtio_ramfb_vmstate;
     dc->hotpluggable = false;
     device_class_set_parent_reset(dc, virtio_ramfb_reset,
                                   &v->parent_reset);
